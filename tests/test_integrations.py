@@ -1,13 +1,30 @@
-"""Tests for Integrations Module - Story 5.1
+"""Tests for Integrations Module - Stories 5.1 & 6.x
 
-Tests for Nanobanana image generation service.
+Tests for Nanobanana image generation and Stripe payments services.
 """
 
 import pytest
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from integrations import NanobananaClient, WinCard, ImageStyle
+from integrations import (
+    StripePaymentsClient,
+    Subscription,
+    SubscriptionTier,
+    SubscriptionStatus,
+    Payment,
+    PaymentStatus,
+    Referral,
+    TIER_PRICING,
+)
+from integrations.stripe_payments import (
+    WebhookEvent,
+    create_free_subscription,
+    create_premium_trial,
+    get_tier_features,
+    get_tier_price,
+)
 from integrations.nanobanana import (
     GenerationStatus,
     GenerationRequest,
@@ -599,6 +616,641 @@ class TestModuleExports:
         """Test integrations module exports expected items."""
         from integrations import __all__
 
+        # Nanobanana exports
         assert 'NanobananaClient' in __all__
         assert 'WinCard' in __all__
         assert 'ImageStyle' in __all__
+
+        # Stripe exports
+        assert 'StripePaymentsClient' in __all__
+        assert 'Subscription' in __all__
+        assert 'SubscriptionTier' in __all__
+        assert 'SubscriptionStatus' in __all__
+        assert 'Payment' in __all__
+        assert 'PaymentStatus' in __all__
+        assert 'Referral' in __all__
+        assert 'TIER_PRICING' in __all__
+
+
+# ============================================================================
+# Stripe Payments Client Tests - Story 6.x
+# ============================================================================
+
+class TestStripePaymentsClient:
+    """Tests for StripePaymentsClient."""
+
+    def test_client_initialization_default(self):
+        """Test client initializes with defaults."""
+        client = StripePaymentsClient()
+
+        assert client.api_key is None
+        assert client.webhook_secret is None
+        assert client._subscriptions == {}
+        assert client._payments == {}
+        assert client._referrals == {}
+
+    def test_client_initialization_custom(self):
+        """Test client initializes with custom values."""
+        client = StripePaymentsClient(
+            api_key="sk_test_123",
+            webhook_secret="whsec_123"
+        )
+
+        assert client.api_key == "sk_test_123"
+        assert client.webhook_secret == "whsec_123"
+
+    @pytest.mark.asyncio
+    async def test_create_subscription_free(self):
+        """Test creating a free subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        subscription = await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.FREE,
+        )
+
+        assert subscription.student_id == "student123"
+        assert subscription.tier == SubscriptionTier.FREE
+        assert subscription.status == SubscriptionStatus.ACTIVE
+        assert subscription.is_active is True
+        assert subscription.stripe_subscription_id is not None
+
+    @pytest.mark.asyncio
+    async def test_create_subscription_with_trial(self):
+        """Test creating subscription with trial period."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        subscription = await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.PREMIUM,
+            trial_days=14,
+        )
+
+        assert subscription.tier == SubscriptionTier.PREMIUM
+        assert subscription.status == SubscriptionStatus.TRIALING
+        assert subscription.trial_ends_at is not None
+        assert subscription.is_active is True
+
+    @pytest.mark.asyncio
+    async def test_create_subscription_duplicate_fails(self):
+        """Test creating duplicate subscription fails."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.BASIC,
+        )
+
+        with pytest.raises(ValueError, match="already has an active subscription"):
+            await client.create_subscription(
+                student_id="student123",
+                tier=SubscriptionTier.PREMIUM,
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_subscription(self):
+        """Test getting a subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.BASIC,
+        )
+
+        subscription = await client.get_subscription("student123")
+
+        assert subscription is not None
+        assert subscription.tier == SubscriptionTier.BASIC
+
+    @pytest.mark.asyncio
+    async def test_get_subscription_not_found(self):
+        """Test getting non-existent subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        subscription = await client.get_subscription("nonexistent")
+
+        assert subscription is None
+
+    @pytest.mark.asyncio
+    async def test_upgrade_subscription(self):
+        """Test upgrading a subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.BASIC,
+        )
+
+        upgraded = await client.upgrade_subscription(
+            student_id="student123",
+            new_tier=SubscriptionTier.PREMIUM,
+        )
+
+        assert upgraded.tier == SubscriptionTier.PREMIUM
+        assert upgraded.metadata.get("previous_tier") == "basic"
+
+    @pytest.mark.asyncio
+    async def test_upgrade_same_tier_fails(self):
+        """Test upgrading to same or lower tier fails."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.PREMIUM,
+        )
+
+        with pytest.raises(ValueError, match="Cannot upgrade"):
+            await client.upgrade_subscription(
+                student_id="student123",
+                new_tier=SubscriptionTier.BASIC,
+            )
+
+    @pytest.mark.asyncio
+    async def test_downgrade_subscription(self):
+        """Test downgrading a subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.PREMIUM,
+        )
+
+        downgraded = await client.downgrade_subscription(
+            student_id="student123",
+            new_tier=SubscriptionTier.BASIC,
+            at_period_end=False,
+        )
+
+        assert downgraded.tier == SubscriptionTier.BASIC
+        assert downgraded.metadata.get("previous_tier") == "premium"
+
+    @pytest.mark.asyncio
+    async def test_downgrade_at_period_end(self):
+        """Test scheduling downgrade at period end."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.PREMIUM,
+        )
+
+        downgraded = await client.downgrade_subscription(
+            student_id="student123",
+            new_tier=SubscriptionTier.BASIC,
+            at_period_end=True,
+        )
+
+        # Tier not changed yet
+        assert downgraded.tier == SubscriptionTier.PREMIUM
+        assert downgraded.metadata.get("scheduled_tier") == "basic"
+
+    @pytest.mark.asyncio
+    async def test_cancel_subscription(self):
+        """Test canceling a subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.BASIC,
+        )
+
+        canceled = await client.cancel_subscription(
+            student_id="student123",
+            at_period_end=True,
+            reason="Testing",
+        )
+
+        assert canceled.cancel_at_period_end is True
+        assert canceled.metadata.get("cancel_reason") == "Testing"
+
+    @pytest.mark.asyncio
+    async def test_cancel_immediately(self):
+        """Test immediate cancellation."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.BASIC,
+        )
+
+        canceled = await client.cancel_subscription(
+            student_id="student123",
+            at_period_end=False,
+        )
+
+        assert canceled.status == SubscriptionStatus.CANCELED
+        assert canceled.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_reactivate_subscription(self):
+        """Test reactivating a canceled subscription."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        await client.create_subscription(
+            student_id="student123",
+            tier=SubscriptionTier.BASIC,
+        )
+
+        await client.cancel_subscription(
+            student_id="student123",
+            at_period_end=False,
+        )
+
+        reactivated = await client.reactivate_subscription("student123")
+
+        assert reactivated.status == SubscriptionStatus.ACTIVE
+        assert reactivated.is_active is True
+
+
+class TestPaymentProcessing:
+    """Tests for payment processing."""
+
+    @pytest.mark.asyncio
+    async def test_process_payment(self):
+        """Test processing a payment."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        payment = await client.process_payment(
+            student_id="student123",
+            amount=1999,  # $19.99
+            description="Premium upgrade",
+        )
+
+        assert payment.student_id == "student123"
+        assert payment.amount == 1999
+        assert payment.status == PaymentStatus.SUCCEEDED
+        assert payment.stripe_payment_intent_id is not None
+        assert payment.completed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_refund_payment(self):
+        """Test refunding a payment."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        payment = await client.process_payment(
+            student_id="student123",
+            amount=1999,
+            description="Test payment",
+        )
+
+        refunded = await client.refund_payment(
+            payment_id=payment.id,
+            reason="Customer request",
+        )
+
+        assert refunded.status == PaymentStatus.REFUNDED
+        assert refunded.refunded_at is not None
+        assert refunded.metadata.get("refund_reason") == "Customer request"
+
+    @pytest.mark.asyncio
+    async def test_partial_refund(self):
+        """Test partial refund."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        payment = await client.process_payment(
+            student_id="student123",
+            amount=2000,
+            description="Test payment",
+        )
+
+        refunded = await client.refund_payment(
+            payment_id=payment.id,
+            amount=1000,  # Partial refund
+        )
+
+        assert refunded.metadata.get("refund_amount") == 1000
+
+
+class TestReferrals:
+    """Tests for referral system."""
+
+    @pytest.mark.asyncio
+    async def test_create_referral_code(self):
+        """Test creating a referral code."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        code = await client.create_referral_code("student123")
+
+        assert code is not None
+        assert len(code) >= 8
+        assert "STUD" in code  # First 4 chars of student_id uppercased
+
+    @pytest.mark.asyncio
+    async def test_get_referral_code(self):
+        """Test getting a student's referral code."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        created = await client.create_referral_code("student123")
+        retrieved = await client.get_referral_code("student123")
+
+        assert retrieved == created
+
+    @pytest.mark.asyncio
+    async def test_referral_processed_on_signup(self):
+        """Test referral is processed when new student signs up."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        # Create referral code for existing student
+        code = await client.create_referral_code("referrer123")
+
+        # New student signs up with referral code
+        await client.create_subscription(
+            student_id="newstudent456",
+            tier=SubscriptionTier.BASIC,
+            referral_code=code,
+        )
+
+        # Check referral stats
+        stats = await client.get_referral_stats("referrer123")
+
+        assert stats["total_referrals"] >= 1
+        assert stats["converted_referrals"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_referral_stats_empty(self):
+        """Test referral stats for student with no referrals."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        stats = await client.get_referral_stats("nostudent")
+
+        assert stats["total_referrals"] == 0
+        assert stats["converted_referrals"] == 0
+
+
+class TestWebhooks:
+    """Tests for webhook handling."""
+
+    @pytest.mark.asyncio
+    async def test_handle_payment_succeeded(self):
+        """Test handling payment succeeded webhook."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        result = await client.handle_webhook(
+            event_type="payment_intent.succeeded",
+            event_data={"id": "pi_test123", "amount": 1999},
+        )
+
+        assert result["handled"] is True
+
+    @pytest.mark.asyncio
+    async def test_handle_subscription_created(self):
+        """Test handling subscription created webhook."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        result = await client.handle_webhook(
+            event_type="customer.subscription.created",
+            event_data={"id": "sub_test123", "customer": "cus_test123"},
+        )
+
+        assert result["handled"] is True
+        assert result["subscription_id"] == "sub_test123"
+
+    @pytest.mark.asyncio
+    async def test_handle_unknown_event(self):
+        """Test handling unknown webhook event."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        result = await client.handle_webhook(
+            event_type="unknown.event.type",
+            event_data={},
+        )
+
+        assert result["handled"] is False
+
+    def test_verify_webhook_no_secret(self):
+        """Test webhook verification fails without secret."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        # Run coroutine synchronously
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(
+            client.verify_webhook(b"payload", "sig")
+        )
+        loop.close()
+
+        assert result is False
+
+
+class TestSubscriptionModel:
+    """Tests for Subscription dataclass."""
+
+    def test_subscription_creation(self):
+        """Test Subscription creation with defaults."""
+        sub = Subscription(
+            id="sub123",
+            student_id="student456",
+            tier=SubscriptionTier.BASIC,
+            status=SubscriptionStatus.ACTIVE,
+        )
+
+        assert sub.id == "sub123"
+        assert sub.student_id == "student456"
+        assert sub.tier == SubscriptionTier.BASIC
+        assert sub.status == SubscriptionStatus.ACTIVE
+        assert sub.is_active is True
+        assert sub.current_period_start is not None
+        assert sub.current_period_end is not None
+
+    def test_subscription_is_active(self):
+        """Test is_active property."""
+        active = Subscription(
+            id="sub1", student_id="s1",
+            tier=SubscriptionTier.BASIC,
+            status=SubscriptionStatus.ACTIVE
+        )
+        trialing = Subscription(
+            id="sub2", student_id="s2",
+            tier=SubscriptionTier.BASIC,
+            status=SubscriptionStatus.TRIALING
+        )
+        canceled = Subscription(
+            id="sub3", student_id="s3",
+            tier=SubscriptionTier.BASIC,
+            status=SubscriptionStatus.CANCELED
+        )
+
+        assert active.is_active is True
+        assert trialing.is_active is True
+        assert canceled.is_active is False
+
+    def test_subscription_days_until_renewal(self):
+        """Test days_until_renewal calculation."""
+        sub = Subscription(
+            id="sub123",
+            student_id="student456",
+            tier=SubscriptionTier.BASIC,
+            status=SubscriptionStatus.ACTIVE,
+            current_period_end=datetime.utcnow() + timedelta(days=15),
+        )
+
+        assert 14 <= sub.days_until_renewal <= 16
+
+    def test_subscription_check_limit(self):
+        """Test checking feature limits."""
+        sub = Subscription(
+            id="sub123",
+            student_id="student456",
+            tier=SubscriptionTier.BASIC,
+            status=SubscriptionStatus.ACTIVE,
+        )
+
+        # Basic tier has unlimited scholarship searches (-1)
+        assert sub.check_limit("scholarship_searches") == -1
+        # Basic tier has 10 comparisons per month
+        assert sub.check_limit("comparisons_per_month") == 10
+
+
+class TestPaymentModel:
+    """Tests for Payment dataclass."""
+
+    def test_payment_creation(self):
+        """Test Payment creation."""
+        payment = Payment(
+            id="pay123",
+            student_id="student456",
+            amount=1999,
+            description="Test payment",
+        )
+
+        assert payment.id == "pay123"
+        assert payment.amount == 1999
+        assert payment.currency == "usd"
+        assert payment.status == PaymentStatus.PENDING
+
+
+class TestReferralModel:
+    """Tests for Referral dataclass."""
+
+    def test_referral_creation(self):
+        """Test Referral creation."""
+        referral = Referral(
+            id="ref123",
+            referrer_id="referrer456",
+            referred_id="referred789",
+            referral_code="CODE123",
+        )
+
+        assert referral.id == "ref123"
+        assert referral.referrer_id == "referrer456"
+        assert referral.status == "pending"
+        assert referral.reward_paid is False
+
+
+class TestTierPricing:
+    """Tests for tier pricing configuration."""
+
+    def test_all_tiers_have_pricing(self):
+        """Test all subscription tiers have pricing."""
+        for tier in SubscriptionTier:
+            assert tier in TIER_PRICING
+
+    def test_pricing_structure(self):
+        """Test pricing structure is correct."""
+        for tier, pricing in TIER_PRICING.items():
+            assert "monthly_price" in pricing
+            assert "annual_price" in pricing
+            assert "features" in pricing
+            assert "limits" in pricing
+            assert isinstance(pricing["features"], list)
+            assert isinstance(pricing["limits"], dict)
+
+    def test_free_tier_is_free(self):
+        """Test free tier has zero price."""
+        free = TIER_PRICING[SubscriptionTier.FREE]
+        assert free["monthly_price"] == 0
+        assert free["annual_price"] == 0
+
+    def test_annual_savings(self):
+        """Test annual pricing provides savings."""
+        for tier in [SubscriptionTier.BASIC, SubscriptionTier.PREMIUM, SubscriptionTier.FAMILY]:
+            pricing = TIER_PRICING[tier]
+            monthly = pricing["monthly_price"] * 12
+            annual = pricing["annual_price"]
+            # Annual should be cheaper than 12 months
+            assert annual < monthly
+
+
+class TestConvenienceFunctionsStripe:
+    """Tests for Stripe convenience functions."""
+
+    @pytest.mark.asyncio
+    async def test_create_free_subscription(self):
+        """Test create_free_subscription convenience function."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        sub = await create_free_subscription(client, "student123")
+
+        assert sub.tier == SubscriptionTier.FREE
+        assert sub.is_active is True
+
+    @pytest.mark.asyncio
+    async def test_create_premium_trial(self):
+        """Test create_premium_trial convenience function."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        sub = await create_premium_trial(
+            client, "student123",
+            trial_days=7,
+        )
+
+        assert sub.tier == SubscriptionTier.PREMIUM
+        assert sub.status == SubscriptionStatus.TRIALING
+
+    def test_get_tier_features(self):
+        """Test get_tier_features function."""
+        features = get_tier_features(SubscriptionTier.PREMIUM)
+
+        assert isinstance(features, list)
+        assert len(features) > 0
+
+    def test_get_tier_price_monthly(self):
+        """Test get_tier_price for monthly."""
+        price = get_tier_price(SubscriptionTier.BASIC, annual=False)
+
+        assert price == 999  # $9.99
+
+    def test_get_tier_price_annual(self):
+        """Test get_tier_price for annual."""
+        price = get_tier_price(SubscriptionTier.BASIC, annual=True)
+
+        assert price == 9999  # $99.99
+
+
+class TestRevenueStats:
+    """Tests for revenue statistics."""
+
+    @pytest.mark.asyncio
+    async def test_get_revenue_stats(self):
+        """Test getting revenue statistics."""
+        client = StripePaymentsClient(api_key="sk_test_123")
+
+        # Create some activity
+        await client.create_subscription(
+            student_id="student1",
+            tier=SubscriptionTier.BASIC,
+        )
+        await client.process_payment(
+            student_id="student1",
+            amount=999,
+            description="Basic subscription",
+        )
+
+        stats = client.get_revenue_stats()
+
+        assert "total_revenue_cents" in stats
+        assert "total_revenue_dollars" in stats
+        assert "active_subscriptions" in stats
+        assert "subscriptions_by_tier" in stats
+        assert stats["total_revenue_cents"] >= 999
+
+    def test_get_stats(self):
+        """Test getting client stats."""
+        client = StripePaymentsClient(
+            api_key="sk_test_123",
+            webhook_secret="whsec_123",
+        )
+
+        stats = client.get_stats()
+
+        assert stats["api_configured"] is True
+        assert stats["webhook_configured"] is True
