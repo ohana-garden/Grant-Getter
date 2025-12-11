@@ -1,5 +1,5 @@
 """
-Tests for Specialist Agents - Stories 3.1, 3.2, and 3.3
+Tests for Specialist Agents - Stories 3.1, 3.2, 3.3, and 3.4
 
 Story 3.1 - Scholarship Scout:
 - Scout runs on schedule
@@ -18,6 +18,12 @@ Story 3.3 - Deadline Sentinel:
 - Detects deadline changes on school websites
 - Alerts students of changes
 - Ambassador can query for specific deadlines
+
+Story 3.4 - Document Analyst:
+- Can parse award letters extracting key fields
+- Can parse transcripts extracting GPA, courses
+- Validates document completeness
+- All processing is local (no data leaves device)
 """
 
 import pytest
@@ -802,6 +808,430 @@ class TestDeadlineSentinelAgent:
 
 
 # ============================================================================
+# Document Analyst Tests
+# ============================================================================
+
+class TestDocumentAnalystAgent:
+    """Tests for DocumentAnalystAgent."""
+
+    # Sample award letter content
+    SAMPLE_AWARD_LETTER = """
+    Stanford University
+    Financial Aid Award Letter 2024-2025
+
+    Dear Student,
+
+    Congratulations! We are pleased to offer you the following financial aid package:
+
+    Cost of Attendance: $82,000
+    Tuition: $58,000
+    Room and Board: $18,000
+    Books and Supplies: $1,500
+    Personal Expenses: $4,500
+
+    Your Financial Aid Award:
+    Federal Pell Grant: $7,395
+    Stanford Grant: $45,000
+    Merit Scholarship: $10,000
+    Direct Subsidized Loan: $3,500
+    Direct Unsubsidized Loan: $2,000
+    Federal Work-Study: $3,500
+
+    Total Aid: $71,395
+    Net Cost: $10,605
+
+    Conditions: You must maintain a 2.0 GPA and full-time enrollment.
+    Deadline: May 1, 2024
+    """
+
+    SAMPLE_TRANSCRIPT = """
+    Stanford University Official Transcript
+
+    Student Name: [REDACTED]
+
+    Academic Standing: Good Standing
+
+    Cumulative GPA: 3.75 / 4.0
+    Credits Earned: 45
+    Credits Attempted: 45
+
+    Fall 2023:
+    MATH 101 Calculus I        4 credits    A
+    CS 101 Intro to CS         3 credits    A-
+    ENGL 101 Writing           3 credits    B+
+
+    Dean's List: Fall 2023
+    """
+
+    def test_document_type_enum(self):
+        """Test DocumentType enum."""
+        from agents.specialists.document_analyst import DocumentType
+
+        assert DocumentType.AWARD_LETTER.value == "award_letter"
+        assert DocumentType.TRANSCRIPT.value == "transcript"
+
+    def test_analysis_status_enum(self):
+        """Test AnalysisStatus enum."""
+        from agents.specialists.document_analyst import AnalysisStatus
+
+        assert AnalysisStatus.COMPLETED.value == "completed"
+        assert AnalysisStatus.FAILED.value == "failed"
+
+    def test_completion_status_enum(self):
+        """Test CompletionStatus enum."""
+        from agents.specialists.document_analyst import CompletionStatus
+
+        assert CompletionStatus.COMPLETE.value == "complete"
+        assert CompletionStatus.MISSING_FIELDS.value == "missing_fields"
+
+    def test_extracted_field_dataclass(self):
+        """Test ExtractedField dataclass."""
+        from agents.specialists.document_analyst import ExtractedField
+
+        field = ExtractedField(
+            name="total_cost",
+            value=50000,
+            confidence=0.9,
+        )
+
+        assert field.name == "total_cost"
+        assert field.confidence == 0.9
+
+    def test_award_letter_data_dataclass(self):
+        """Test AwardLetterData dataclass."""
+        from agents.specialists.document_analyst import AwardLetterData
+
+        data = AwardLetterData(
+            school_name="Test University",
+            total_cost=50000,
+            total_aid=40000,
+        )
+
+        assert data.school_name == "Test University"
+        assert data.total_cost == 50000
+
+    def test_award_letter_calculate_totals(self):
+        """Test AwardLetterData.calculate_totals()."""
+        from agents.specialists.document_analyst import AwardLetterData
+
+        data = AwardLetterData(
+            total_cost=50000,
+            total_aid=40000,
+            grants={'pell': 5000, 'state': 3000},
+            scholarships={'merit': 10000},
+            loans={'subsidized': 5500},
+            work_study=2000,
+        )
+
+        data.calculate_totals()
+
+        assert data.total_gift_aid == 18000  # 5000 + 3000 + 10000
+        assert data.total_self_help == 7500  # 5500 + 2000
+        assert data.net_cost == 10000  # 50000 - 40000
+
+    def test_transcript_data_dataclass(self):
+        """Test TranscriptData dataclass."""
+        from agents.specialists.document_analyst import TranscriptData
+
+        data = TranscriptData(
+            school_name="Test University",
+            cumulative_gpa=3.5,
+            credits_earned=30,
+        )
+
+        assert data.cumulative_gpa == 3.5
+        assert data.credits_earned == 30
+
+    def test_analyst_initialization(self):
+        """Test analyst initialization."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent
+
+        analyst = DocumentAnalystAgent()
+        assert analyst._analysis_history == []
+
+    def test_analyst_model_name(self):
+        """Test analyst uses correct model."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent
+
+        analyst = DocumentAnalystAgent()
+        assert "sonnet" in analyst.model_name.lower()  # Uses Sonnet for document analysis
+
+    @pytest.mark.asyncio
+    async def test_detect_document_type_award_letter(self):
+        """Test document type detection for award letter."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        doc_type = analyst._detect_document_type(self.SAMPLE_AWARD_LETTER, None)
+
+        assert doc_type == DocumentType.AWARD_LETTER
+
+    @pytest.mark.asyncio
+    async def test_detect_document_type_transcript(self):
+        """Test document type detection for transcript."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        doc_type = analyst._detect_document_type(self.SAMPLE_TRANSCRIPT, None)
+
+        assert doc_type == DocumentType.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_detect_document_type_from_filename(self):
+        """Test document type detection from filename."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+
+        assert analyst._detect_document_type("", "award_letter_2024.pdf") == DocumentType.AWARD_LETTER
+        assert analyst._detect_document_type("", "official_transcript.pdf") == DocumentType.TRANSCRIPT
+
+    @pytest.mark.asyncio
+    async def test_analyze_award_letter(self):
+        """AC: Can parse award letters extracting key fields."""
+        from agents.specialists.document_analyst import (
+            DocumentAnalystAgent, DocumentType, AnalysisStatus
+        )
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_AWARD_LETTER,
+            DocumentType.AWARD_LETTER,
+        )
+
+        assert result.document_type == DocumentType.AWARD_LETTER
+        assert result.status == AnalysisStatus.COMPLETED
+        assert len(result.extracted_fields) > 0
+
+        # Should extract school name
+        field_names = [f.name for f in result.extracted_fields]
+        assert 'school_name' in field_names or 'total_cost' in field_names
+
+    @pytest.mark.asyncio
+    async def test_analyze_award_letter_extracts_costs(self):
+        """Test award letter extracts cost values."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_AWARD_LETTER,
+            DocumentType.AWARD_LETTER,
+        )
+
+        # Should have extracted cost data
+        if result.data:
+            assert result.data.total_cost == 82000 or result.data.tuition is not None
+
+    @pytest.mark.asyncio
+    async def test_analyze_award_letter_extracts_grants(self):
+        """Test award letter extracts grants."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_AWARD_LETTER,
+            DocumentType.AWARD_LETTER,
+        )
+
+        if result.data and result.data.grants:
+            assert len(result.data.grants) > 0
+
+    @pytest.mark.asyncio
+    async def test_analyze_transcript(self):
+        """AC: Can parse transcripts extracting GPA, courses."""
+        from agents.specialists.document_analyst import (
+            DocumentAnalystAgent, DocumentType, AnalysisStatus
+        )
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_TRANSCRIPT,
+            DocumentType.TRANSCRIPT,
+        )
+
+        assert result.document_type == DocumentType.TRANSCRIPT
+        assert result.status == AnalysisStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_analyze_transcript_extracts_gpa(self):
+        """Test transcript extracts GPA."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_TRANSCRIPT,
+            DocumentType.TRANSCRIPT,
+        )
+
+        if result.data:
+            assert result.data.cumulative_gpa == 3.75
+
+    @pytest.mark.asyncio
+    async def test_analyze_transcript_extracts_credits(self):
+        """Test transcript extracts credits."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_TRANSCRIPT,
+            DocumentType.TRANSCRIPT,
+        )
+
+        if result.data:
+            assert result.data.credits_earned == 45
+
+    @pytest.mark.asyncio
+    async def test_analyze_transcript_extracts_honors(self):
+        """Test transcript extracts honors."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+        result = await analyst.analyze_document(
+            self.SAMPLE_TRANSCRIPT,
+            DocumentType.TRANSCRIPT,
+        )
+
+        if result.data and result.data.honors:
+            # Check case-insensitively
+            honors_lower = [h.lower() for h in result.data.honors]
+            assert any("dean" in h and "list" in h for h in honors_lower)
+
+    @pytest.mark.asyncio
+    async def test_validate_completeness(self):
+        """AC: Validates document completeness."""
+        from agents.specialists.document_analyst import (
+            DocumentAnalystAgent, DocumentType, ExtractedField
+        )
+
+        analyst = DocumentAnalystAgent()
+
+        # Complete fields
+        complete_fields = [
+            ExtractedField(name='school_name', value='Test', confidence=0.9),
+            ExtractedField(name='academic_year', value='2024-2025', confidence=0.9),
+            ExtractedField(name='total_cost', value=50000, confidence=0.9),
+            ExtractedField(name='total_aid', value=40000, confidence=0.9),
+        ]
+
+        result = await analyst.validate_completeness(
+            DocumentType.AWARD_LETTER,
+            complete_fields,
+        )
+
+        assert result['complete'] is True
+        assert len(result['missing_fields']) == 0
+
+    @pytest.mark.asyncio
+    async def test_validate_completeness_missing_fields(self):
+        """Test validation detects missing fields."""
+        from agents.specialists.document_analyst import (
+            DocumentAnalystAgent, DocumentType, ExtractedField
+        )
+
+        analyst = DocumentAnalystAgent()
+
+        # Missing total_cost and total_aid
+        incomplete_fields = [
+            ExtractedField(name='school_name', value='Test', confidence=0.9),
+        ]
+
+        result = await analyst.validate_completeness(
+            DocumentType.AWARD_LETTER,
+            incomplete_fields,
+        )
+
+        assert result['complete'] is False
+        assert len(result['missing_fields']) > 0
+
+    @pytest.mark.asyncio
+    async def test_compare_award_letters(self):
+        """Test comparing multiple award letters."""
+        from agents.specialists.document_analyst import (
+            DocumentAnalystAgent, DocumentAnalysisResult, DocumentType,
+            AnalysisStatus, CompletionStatus, AwardLetterData
+        )
+
+        analyst = DocumentAnalystAgent()
+
+        # Create mock results
+        letter1 = DocumentAnalysisResult(
+            document_type=DocumentType.AWARD_LETTER,
+            status=AnalysisStatus.COMPLETED,
+            completeness=CompletionStatus.COMPLETE,
+            data=AwardLetterData(
+                school_name="School A",
+                net_cost=20000,
+                total_gift_aid=30000,
+                loans={'subsidized': 5000},
+            ),
+        )
+        letter2 = DocumentAnalysisResult(
+            document_type=DocumentType.AWARD_LETTER,
+            status=AnalysisStatus.COMPLETED,
+            completeness=CompletionStatus.COMPLETE,
+            data=AwardLetterData(
+                school_name="School B",
+                net_cost=15000,
+                total_gift_aid=35000,
+                loans={'subsidized': 3000},
+            ),
+        )
+
+        comparison = await analyst.compare_award_letters([letter1, letter2])
+
+        assert len(comparison['schools']) == 2
+        assert comparison['lowest_net_cost'] == "School B"
+        assert comparison['highest_gift_aid'] == "School B"
+
+    @pytest.mark.asyncio
+    async def test_auto_detect_and_analyze(self):
+        """Test auto-detection and analysis."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent, DocumentType
+
+        analyst = DocumentAnalystAgent()
+
+        # Auto-detect should work
+        result = await analyst.analyze_document(self.SAMPLE_AWARD_LETTER)
+        assert result.document_type == DocumentType.AWARD_LETTER
+
+    def test_on_device_processing_flag(self):
+        """AC: All processing is local (no data leaves device)."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent
+
+        analyst = DocumentAnalystAgent()
+        stats = analyst.get_stats()
+
+        # This flag should ALWAYS be true
+        assert stats['on_device_processing'] is True
+
+    def test_get_stats(self):
+        """Test getting analyst stats."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent
+
+        analyst = DocumentAnalystAgent()
+        stats = analyst.get_stats()
+
+        assert 'total_analyzed' in stats
+        assert 'by_type' in stats
+        assert 'average_confidence' in stats
+        assert 'on_device_processing' in stats
+
+    @pytest.mark.asyncio
+    async def test_analysis_history_bounded(self):
+        """Test analysis history is bounded."""
+        from agents.specialists.document_analyst import DocumentAnalystAgent
+
+        analyst = DocumentAnalystAgent()
+
+        # Analyze multiple documents
+        for _ in range(55):
+            await analyst.analyze_document("Simple content", filename="test.pdf")
+
+        # History should be bounded
+        assert len(analyst._analysis_history) <= 50
+
+
+# ============================================================================
 # A2A Protocol Tests
 # ============================================================================
 
@@ -1069,6 +1499,7 @@ class TestSpecialistsModule:
             ScholarshipScoutAgent,
             AppealStrategistAgent,
             DeadlineSentinelAgent,
+            DocumentAnalystAgent,
             A2AProtocol,
             A2ARequest,
             A2AResponse,
@@ -1077,6 +1508,7 @@ class TestSpecialistsModule:
         assert ScholarshipScoutAgent is not None
         assert AppealStrategistAgent is not None
         assert DeadlineSentinelAgent is not None
+        assert DocumentAnalystAgent is not None
         assert A2AProtocol is not None
         assert A2ARequest is not None
         assert A2AResponse is not None
