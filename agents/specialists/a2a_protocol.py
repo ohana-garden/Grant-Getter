@@ -28,9 +28,14 @@ class A2AAction(Enum):
     DRAFT_APPEAL = "draft_appeal"
     GET_SUCCESS_PATTERNS = "get_success_patterns"
 
-    # Deadline Sentinel actions (future)
+    # Deadline Sentinel actions
     GET_DEADLINES = "get_deadlines"
+    GET_UPCOMING_DEADLINES = "get_upcoming_deadlines"
+    GET_URGENT_DEADLINES = "get_urgent_deadlines"
     SCRAPE_DEADLINE = "scrape_deadline"
+    VERIFY_DEADLINE = "verify_deadline"
+    SUBSCRIBE_DEADLINE = "subscribe_deadline"
+    GET_SENTINEL_STATS = "get_sentinel_stats"
 
     # Generic
     HEALTH_CHECK = "health_check"
@@ -309,6 +314,89 @@ class A2AProtocol:
                 school_id=params.get('school_id'),
             )
             return {'patterns': patterns}
+
+        # Deadline Sentinel actions
+        elif action == A2AAction.GET_DEADLINES:
+            deadlines = await agent.get_deadlines(
+                student_id=params.get('student_id'),
+                school_id=params.get('school_id'),
+                include_past=params.get('include_past', False),
+                limit=params.get('limit', 20),
+            )
+            return {
+                'deadlines': [
+                    {
+                        'id': d.id,
+                        'name': d.name,
+                        'due_date': d.due_date.isoformat(),
+                        'days_until': d.days_until,
+                        'deadline_type': d.deadline_type.value,
+                        'status': d.status.value,
+                        'school_name': d.school_name,
+                    }
+                    for d in deadlines
+                ]
+            }
+
+        elif action == A2AAction.GET_UPCOMING_DEADLINES:
+            deadlines = await agent.get_upcoming_deadlines(
+                days_ahead=params.get('days_ahead', 30),
+            )
+            return {
+                'deadlines': [
+                    {
+                        'id': d.id,
+                        'name': d.name,
+                        'due_date': d.due_date.isoformat(),
+                        'days_until': d.days_until,
+                        'deadline_type': d.deadline_type.value,
+                    }
+                    for d in deadlines
+                ]
+            }
+
+        elif action == A2AAction.GET_URGENT_DEADLINES:
+            deadlines = await agent.get_urgent_deadlines()
+            return {
+                'deadlines': [
+                    {
+                        'id': d.id,
+                        'name': d.name,
+                        'due_date': d.due_date.isoformat(),
+                        'days_until': d.days_until,
+                        'deadline_type': d.deadline_type.value,
+                    }
+                    for d in deadlines
+                ]
+            }
+
+        elif action == A2AAction.SCRAPE_DEADLINE:
+            result = await agent.scrape_deadline(
+                url=params.get('url', ''),
+                school_id=params.get('school_id'),
+            )
+            return {
+                'source_url': result.source_url,
+                'deadlines_found': result.deadlines_found,
+                'new_deadlines': result.new_deadlines,
+                'success': result.success,
+            }
+
+        elif action == A2AAction.VERIFY_DEADLINE:
+            result = await agent.verify_deadline(
+                deadline_id=params.get('deadline_id', ''),
+            )
+            return result
+
+        elif action == A2AAction.SUBSCRIBE_DEADLINE:
+            success = await agent.subscribe_student(
+                student_id=params.get('student_id', ''),
+                deadline_id=params.get('deadline_id', ''),
+            )
+            return {'success': success}
+
+        elif action == A2AAction.GET_SENTINEL_STATS:
+            return agent.get_stats()
 
         # Generic actions
         elif action == A2AAction.HEALTH_CHECK:

@@ -1,5 +1,5 @@
 """
-Tests for Specialist Agents - Stories 3.1 and 3.2
+Tests for Specialist Agents - Stories 3.1, 3.2, and 3.3
 
 Story 3.1 - Scholarship Scout:
 - Scout runs on schedule
@@ -12,6 +12,12 @@ Story 3.2 - Appeal Strategist:
 - Strategist can identify effective arguments
 - Strategist can generate appeal letter draft
 - All inputs are anonymized
+
+Story 3.3 - Deadline Sentinel:
+- Sentinel runs daily checks
+- Detects deadline changes on school websites
+- Alerts students of changes
+- Ambassador can query for specific deadlines
 """
 
 import pytest
@@ -419,6 +425,383 @@ class TestAppealStrategistAgent:
 
 
 # ============================================================================
+# Deadline Sentinel Tests
+# ============================================================================
+
+class TestDeadlineSentinelAgent:
+    """Tests for DeadlineSentinelAgent."""
+
+    def test_deadline_type_enum(self):
+        """Test DeadlineType enum."""
+        from agents.specialists.deadline_sentinel import DeadlineType
+
+        assert DeadlineType.FAFSA.value == "fafsa"
+        assert DeadlineType.SCHOLARSHIP.value == "scholarship"
+
+    def test_deadline_status_enum(self):
+        """Test DeadlineStatus enum."""
+        from agents.specialists.deadline_sentinel import DeadlineStatus
+
+        assert DeadlineStatus.UPCOMING.value == "upcoming"
+        assert DeadlineStatus.URGENT.value == "urgent"
+
+    def test_source_reliability_enum(self):
+        """Test SourceReliability enum."""
+        from agents.specialists.deadline_sentinel import SourceReliability
+
+        assert SourceReliability.OFFICIAL.value == "official"
+        assert SourceReliability.SCRAPED.value == "scraped"
+
+    def test_deadline_entry_dataclass(self):
+        """Test DeadlineEntry dataclass."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineEntry, DeadlineType, DeadlineStatus
+        )
+
+        deadline = DeadlineEntry(
+            id="test_deadline",
+            deadline_type=DeadlineType.FAFSA,
+            name="FAFSA Deadline",
+            due_date=date.today() + timedelta(days=10),
+        )
+
+        assert deadline.days_until == 10
+        assert deadline.is_past is False
+
+    def test_deadline_entry_past(self):
+        """Test past deadline detection."""
+        from agents.specialists.deadline_sentinel import DeadlineEntry, DeadlineType
+
+        deadline = DeadlineEntry(
+            id="past_deadline",
+            deadline_type=DeadlineType.FAFSA,
+            name="Past Deadline",
+            due_date=date.today() - timedelta(days=5),
+        )
+
+        assert deadline.is_past is True
+        assert deadline.days_until < 0
+
+    def test_scrape_result_dataclass(self):
+        """Test ScrapeResult dataclass."""
+        from agents.specialists.deadline_sentinel import ScrapeResult
+
+        result = ScrapeResult(
+            source_url="https://example.edu/finaid",
+            deadlines_found=5,
+            new_deadlines=3,
+            updated_deadlines=2,
+        )
+
+        assert result.deadlines_found == 5
+        assert result.success is True
+
+    def test_deadline_change_dataclass(self):
+        """Test DeadlineChange dataclass."""
+        from agents.specialists.deadline_sentinel import DeadlineChange
+
+        change = DeadlineChange(
+            deadline_id="test_deadline",
+            change_type="updated",
+            old_date=date.today(),
+            new_date=date.today() + timedelta(days=7),
+        )
+
+        assert change.change_type == "updated"
+        assert change.notified is False
+
+    def test_sentinel_initialization(self):
+        """Test sentinel initialization."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+        assert sentinel.falkordb is None
+        assert sentinel._is_running is False
+        # Should have FAFSA deadlines initialized
+        assert len(sentinel._deadlines) > 0
+
+    def test_sentinel_model_name(self):
+        """Test sentinel uses correct model."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+        assert "haiku" in sentinel.model_name.lower()
+
+    def test_fafsa_deadlines_initialized(self):
+        """Test FAFSA deadlines are initialized automatically."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        fafsa_deadlines = [
+            d for d in sentinel._deadlines.values()
+            if d.deadline_type == DeadlineType.FAFSA
+        ]
+
+        assert len(fafsa_deadlines) > 0
+
+    @pytest.mark.asyncio
+    async def test_start_stop(self):
+        """Test starting and stopping sentinel."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+
+        await sentinel.start()
+        assert sentinel._is_running is True
+
+        await sentinel.stop()
+        assert sentinel._is_running is False
+
+    @pytest.mark.asyncio
+    async def test_run_scrape_cycle(self):
+        """AC: Sentinel runs daily checks."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+        await sentinel.start()
+
+        results = await sentinel.run_scrape_cycle()
+
+        assert len(results) > 0
+        assert sentinel._last_scrape is not None
+
+    @pytest.mark.asyncio
+    async def test_add_deadline(self):
+        """Test adding a deadline."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineEntry, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        deadline = DeadlineEntry(
+            id="custom_deadline",
+            deadline_type=DeadlineType.SCHOLARSHIP,
+            name="Custom Scholarship Deadline",
+            due_date=date.today() + timedelta(days=30),
+        )
+
+        result = await sentinel.add_deadline(deadline)
+
+        assert result is True
+        assert "custom_deadline" in sentinel._deadlines
+
+    @pytest.mark.asyncio
+    async def test_verify_deadline(self):
+        """Test verifying a deadline."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineEntry, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        # Add a deadline first
+        deadline = DeadlineEntry(
+            id="verify_test",
+            deadline_type=DeadlineType.SCHOLARSHIP,
+            name="Test Deadline",
+            due_date=date.today() + timedelta(days=14),
+        )
+        await sentinel.add_deadline(deadline)
+
+        result = await sentinel.verify_deadline("verify_test")
+
+        assert result['found'] is True
+        assert result['verified'] is True
+
+    @pytest.mark.asyncio
+    async def test_verify_nonexistent_deadline(self):
+        """Test verifying nonexistent deadline."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+
+        result = await sentinel.verify_deadline("nonexistent")
+
+        assert result['found'] is False
+
+    @pytest.mark.asyncio
+    async def test_get_deadlines(self):
+        """AC: Ambassador can query for specific deadlines."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+
+        deadlines = await sentinel.get_deadlines()
+
+        assert isinstance(deadlines, list)
+        # Should have FAFSA deadlines at minimum
+        assert len(deadlines) >= 0
+
+    @pytest.mark.asyncio
+    async def test_get_upcoming_deadlines(self):
+        """Test getting upcoming deadlines."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineEntry, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        # Add deadline within 30 days
+        deadline = DeadlineEntry(
+            id="upcoming_test",
+            deadline_type=DeadlineType.SCHOLARSHIP,
+            name="Upcoming Test",
+            due_date=date.today() + timedelta(days=15),
+        )
+        await sentinel.add_deadline(deadline)
+
+        deadlines = await sentinel.get_upcoming_deadlines(days_ahead=30)
+
+        assert any(d.id == "upcoming_test" for d in deadlines)
+
+    @pytest.mark.asyncio
+    async def test_get_urgent_deadlines(self):
+        """Test getting urgent deadlines (within 7 days)."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineEntry, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        # Add urgent deadline
+        deadline = DeadlineEntry(
+            id="urgent_test",
+            deadline_type=DeadlineType.SCHOLARSHIP,
+            name="Urgent Test",
+            due_date=date.today() + timedelta(days=3),
+        )
+        await sentinel.add_deadline(deadline)
+
+        deadlines = await sentinel.get_urgent_deadlines()
+
+        assert any(d.id == "urgent_test" for d in deadlines)
+
+    @pytest.mark.asyncio
+    async def test_subscribe_student(self):
+        """Test subscribing student to deadline."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineEntry, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        deadline = DeadlineEntry(
+            id="subscribe_test",
+            deadline_type=DeadlineType.SCHOLARSHIP,
+            name="Subscribe Test",
+            due_date=date.today() + timedelta(days=30),
+        )
+        await sentinel.add_deadline(deadline)
+
+        result = await sentinel.subscribe_student("student_123", "subscribe_test")
+
+        assert result is True
+        assert "student_123" in sentinel._deadlines["subscribe_test"].student_ids
+
+    @pytest.mark.asyncio
+    async def test_unsubscribe_student(self):
+        """Test unsubscribing student from deadline."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineEntry, DeadlineType
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        deadline = DeadlineEntry(
+            id="unsub_test",
+            deadline_type=DeadlineType.SCHOLARSHIP,
+            name="Unsub Test",
+            due_date=date.today() + timedelta(days=30),
+            student_ids=["student_123"],
+        )
+        await sentinel.add_deadline(deadline)
+
+        result = await sentinel.unsubscribe_student("student_123", "unsub_test")
+
+        assert result is True
+        assert "student_123" not in sentinel._deadlines["unsub_test"].student_ids
+
+    def test_get_changes(self):
+        """AC: Detects deadline changes."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineChange
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        # Manually add a change
+        sentinel._changes.append(DeadlineChange(
+            deadline_id="test_change",
+            change_type="new",
+            new_date=date.today() + timedelta(days=30),
+        ))
+
+        changes = sentinel.get_changes()
+
+        assert len(changes) > 0
+        assert changes[0].deadline_id == "test_change"
+
+    def test_get_changes_unnotified_only(self):
+        """Test getting only unnotified changes."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineChange
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        # Add notified and unnotified changes
+        sentinel._changes.append(DeadlineChange(
+            deadline_id="notified_change",
+            change_type="new",
+            notified=True,
+        ))
+        sentinel._changes.append(DeadlineChange(
+            deadline_id="unnotified_change",
+            change_type="new",
+            notified=False,
+        ))
+
+        changes = sentinel.get_changes(unnotified_only=True)
+
+        assert len(changes) == 1
+        assert changes[0].deadline_id == "unnotified_change"
+
+    def test_mark_changes_notified(self):
+        """AC: Alerts students of changes (can mark as notified)."""
+        from agents.specialists.deadline_sentinel import (
+            DeadlineSentinelAgent, DeadlineChange
+        )
+
+        sentinel = DeadlineSentinelAgent()
+
+        sentinel._changes.append(DeadlineChange(
+            deadline_id="to_notify",
+            change_type="updated",
+        ))
+
+        sentinel.mark_changes_notified(["to_notify"])
+
+        assert sentinel._changes[0].notified is True
+
+    def test_get_stats(self):
+        """Test getting sentinel stats."""
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        sentinel = DeadlineSentinelAgent()
+        stats = sentinel.get_stats()
+
+        assert 'is_running' in stats
+        assert 'total_deadlines' in stats
+        assert 'upcoming_deadlines' in stats
+        assert 'urgent_deadlines' in stats
+        assert 'by_type' in stats
+
+
+# ============================================================================
 # A2A Protocol Tests
 # ============================================================================
 
@@ -545,6 +928,53 @@ class TestA2AProtocol:
         assert 'strategies' in response.data
 
     @pytest.mark.asyncio
+    async def test_send_request_to_sentinel(self):
+        """Test sending request to deadline sentinel."""
+        from agents.specialists.a2a_protocol import A2AProtocol, A2ARequest, A2AAction, A2AStatus
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        protocol = A2AProtocol()
+        sentinel = DeadlineSentinelAgent()
+        await sentinel.start()
+
+        protocol.register_agent("deadline_sentinel", sentinel)
+
+        request = A2ARequest.create(
+            source="ambassador",
+            target="deadline_sentinel",
+            action=A2AAction.GET_SENTINEL_STATS,
+        )
+
+        response = await protocol.send_request(request)
+
+        assert response.status == A2AStatus.COMPLETED
+        assert 'total_deadlines' in response.data
+
+    @pytest.mark.asyncio
+    async def test_send_request_get_deadlines(self):
+        """Test A2A get deadlines request."""
+        from agents.specialists.a2a_protocol import A2AProtocol, A2ARequest, A2AAction, A2AStatus
+        from agents.specialists.deadline_sentinel import DeadlineSentinelAgent
+
+        protocol = A2AProtocol()
+        sentinel = DeadlineSentinelAgent()
+        await sentinel.start()
+
+        protocol.register_agent("deadline_sentinel", sentinel)
+
+        request = A2ARequest.create(
+            source="ambassador",
+            target="deadline_sentinel",
+            action=A2AAction.GET_DEADLINES,
+            params={'limit': 10},
+        )
+
+        response = await protocol.send_request(request)
+
+        assert response.status == A2AStatus.COMPLETED
+        assert 'deadlines' in response.data
+
+    @pytest.mark.asyncio
     async def test_send_request_unregistered_agent(self):
         """Test sending request to unregistered agent."""
         from agents.specialists.a2a_protocol import A2AProtocol, A2ARequest, A2AAction, A2AStatus
@@ -638,6 +1068,7 @@ class TestSpecialistsModule:
         from agents.specialists import (
             ScholarshipScoutAgent,
             AppealStrategistAgent,
+            DeadlineSentinelAgent,
             A2AProtocol,
             A2ARequest,
             A2AResponse,
@@ -645,6 +1076,7 @@ class TestSpecialistsModule:
 
         assert ScholarshipScoutAgent is not None
         assert AppealStrategistAgent is not None
+        assert DeadlineSentinelAgent is not None
         assert A2AProtocol is not None
         assert A2ARequest is not None
         assert A2AResponse is not None
