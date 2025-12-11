@@ -1,7 +1,7 @@
-"""Tests for Communication Channels - Stories 4.2 & 4.3"""
+"""Tests for Communication Channels - Stories 4.1, 4.2 & 4.3"""
 
 import pytest
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from channels import (
     HumeVoiceClient,
@@ -10,6 +10,19 @@ from channels import (
     WebChatHandler,
     ChatMessage,
     ChatSession,
+    SMSRCSClient,
+    SMSMessage,
+    Conversation,
+    PhoneNumber,
+    RCSCard,
+    MessageChannel,
+    MessageStatus,
+    MESSAGE_TEMPLATES,
+)
+from channels.sms_rcs import (
+    MessageDirection,
+    send_reminder,
+    send_bulk_deadline_reminders,
 )
 from channels.hume_voice import (
     EmotionCategory,
@@ -743,3 +756,620 @@ class TestChannelStats:
 
         stats3 = handler.get_stats()
         assert stats3["connected_websockets"] == 1
+
+
+# ===========================================================================
+# SMS/RCS Tests (Story 4.1)
+# ===========================================================================
+
+class TestSMSRCSClient:
+    """Tests for SMSRCSClient."""
+
+    def test_client_initialization_default(self):
+        """Test client initializes with defaults."""
+        client = SMSRCSClient()
+
+        assert client.account_sid is None
+        assert client.auth_token is None
+        assert client._phone_numbers == {}
+        assert client._conversations == {}
+        assert client._messages == []
+
+    def test_client_initialization_custom(self):
+        """Test client initializes with custom values."""
+        client = SMSRCSClient(
+            account_sid="AC12345",
+            auth_token="token123",
+            phone_number="+15551234567",
+        )
+
+        assert client.account_sid == "AC12345"
+        assert client.auth_token == "token123"
+        assert client.phone_number == "+15551234567"
+
+    @pytest.mark.asyncio
+    async def test_register_phone(self):
+        """Test registering a phone number."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        phone = await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        assert phone.number == "+15551234567"
+        assert phone.verified is True  # Not requiring verification
+
+    @pytest.mark.asyncio
+    async def test_register_phone_normalizes(self):
+        """Test phone number normalization."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        phone = await client.register_phone(
+            student_id="student123",
+            phone_number="(555) 123-4567",
+            verify=False,
+        )
+
+        assert phone.number == "+15551234567"
+
+    @pytest.mark.asyncio
+    async def test_opt_in(self):
+        """Test opting in a student."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        result = await client.opt_in("student123")
+        assert result is True
+        assert client.is_opted_in("student123") is True
+
+    @pytest.mark.asyncio
+    async def test_opt_out(self):
+        """Test opting out a student."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        await client.opt_out("student123")
+
+        assert client.is_opted_in("student123") is False
+
+    @pytest.mark.asyncio
+    async def test_send_message(self):
+        """Test sending a message."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await client.send_message(
+            student_id="student123",
+            content="Hello, this is a test!",
+        )
+
+        assert message is not None
+        assert message.content == "Hello, this is a test!"
+        assert message.status == MessageStatus.SENT
+        assert message.direction == MessageDirection.OUTBOUND
+        assert message.twilio_sid is not None
+
+    @pytest.mark.asyncio
+    async def test_send_message_not_opted_in(self):
+        """Test sending message to non-opted-in student fails."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+        await client.opt_out("student123")
+
+        message = await client.send_message(
+            student_id="student123",
+            content="Test",
+        )
+
+        assert message is None  # Should not send
+
+    @pytest.mark.asyncio
+    async def test_send_message_bypass_opt_in(self):
+        """Test bypass opt-in for confirmation messages."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+        await client.opt_out("student123")
+
+        message = await client.send_message(
+            student_id="student123",
+            content="Opt-out confirmation",
+            bypass_opt_in=True,
+        )
+
+        assert message is not None
+        assert message.status == MessageStatus.SENT
+
+
+class TestSMSRCSTemplates:
+    """Tests for message templates."""
+
+    def test_all_templates_exist(self):
+        """Test all expected templates exist."""
+        expected = [
+            "deadline_reminder_7day",
+            "deadline_reminder_24hr",
+            "scholarship_match",
+            "aid_received",
+            "appeal_update",
+            "weekly_summary",
+            "opt_in_confirmation",
+            "opt_out_confirmation",
+        ]
+
+        for template_name in expected:
+            assert template_name in MESSAGE_TEMPLATES
+
+    def test_template_structure(self):
+        """Test template structure."""
+        for name, template in MESSAGE_TEMPLATES.items():
+            assert "sms" in template, f"Missing SMS template in {name}"
+            assert isinstance(template["sms"], str)
+
+    @pytest.mark.asyncio
+    async def test_send_template(self):
+        """Test sending a templated message."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await client.send_template(
+            student_id="student123",
+            template_name="deadline_reminder_7day",
+            context={
+                "name": "Alex",
+                "deadline_name": "FAFSA",
+                "date": "January 15, 2025",
+            },
+        )
+
+        assert message is not None
+        assert "Alex" in message.content
+        assert "FAFSA" in message.content
+        assert "7 days" in message.content
+
+
+class TestSMSRCSDeadlineReminders:
+    """Tests for deadline reminders."""
+
+    @pytest.mark.asyncio
+    async def test_send_7day_reminder(self):
+        """Test 7-day deadline reminder."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await client.send_deadline_reminder(
+            student_id="student123",
+            deadline_name="CSS Profile",
+            deadline_date=datetime.utcnow() + timedelta(days=7),
+            days_until=7,
+        )
+
+        assert message is not None
+        assert "CSS Profile" in message.content
+
+    @pytest.mark.asyncio
+    async def test_send_24hr_reminder(self):
+        """Test 24-hour deadline reminder."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await client.send_deadline_reminder(
+            student_id="student123",
+            deadline_name="FAFSA",
+            deadline_date=datetime.utcnow() + timedelta(hours=20),
+            days_until=1,
+        )
+
+        assert message is not None
+        assert "URGENT" in message.content
+        assert "FAFSA" in message.content
+
+
+class TestSMSRCSScholarshipNotifications:
+    """Tests for scholarship notifications."""
+
+    @pytest.mark.asyncio
+    async def test_send_scholarship_notification(self):
+        """Test scholarship notification."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await client.send_scholarship_notification(
+            student_id="student123",
+            scholarship_name="Gates Millennium Scholars",
+            amount="$20,000",
+            deadline="February 15, 2025",
+        )
+
+        assert message is not None
+        assert "Gates Millennium" in message.content
+        assert "$20,000" in message.content
+
+
+class TestSMSRCSInbound:
+    """Tests for inbound message handling."""
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_message(self):
+        """Test handling an inbound message."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await client.handle_inbound_message(
+            from_number="+15551234567",
+            content="Hello, I need help!",
+        )
+
+        assert message is not None
+        assert message.direction == MessageDirection.INBOUND
+        assert message.content == "Hello, I need help!"
+
+    @pytest.mark.asyncio
+    async def test_handle_stop_command(self):
+        """Test handling STOP command."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        await client.handle_inbound_message(
+            from_number="+15551234567",
+            content="STOP",
+        )
+
+        assert client.is_opted_in("student123") is False
+
+    @pytest.mark.asyncio
+    async def test_handle_start_command(self):
+        """Test handling START command."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+        await client.opt_out("student123")
+
+        await client.handle_inbound_message(
+            from_number="+15551234567",
+            content="START",
+        )
+
+        assert client.is_opted_in("student123") is True
+
+
+class TestSMSRCSConversation:
+    """Tests for conversation tracking."""
+
+    @pytest.mark.asyncio
+    async def test_conversation_created(self):
+        """Test conversation is created on first message."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        await client.send_message(
+            student_id="student123",
+            content="Test message",
+        )
+
+        conv = client.get_conversation("student123")
+        assert conv is not None
+        assert conv.student_id == "student123"
+        assert len(conv.messages) == 1
+
+    @pytest.mark.asyncio
+    async def test_conversation_accumulates_messages(self):
+        """Test conversation accumulates messages."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        await client.send_message(student_id="student123", content="Message 1")
+        await client.send_message(student_id="student123", content="Message 2")
+        await client.handle_inbound_message(
+            from_number="+15551234567",
+            content="Reply",
+        )
+
+        conv = client.get_conversation("student123")
+        assert len(conv.messages) == 3
+
+
+class TestSMSRCSRateLimiting:
+    """Tests for rate limiting."""
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_enforced(self):
+        """Test rate limiting is enforced."""
+        client = SMSRCSClient(account_sid="AC12345")
+        client.rate_limit_per_minute = 3
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        # Send up to limit
+        for i in range(3):
+            msg = await client.send_message(
+                student_id="student123",
+                content=f"Message {i}",
+            )
+            assert msg is not None
+
+        # This should be blocked
+        msg = await client.send_message(
+            student_id="student123",
+            content="Blocked message",
+        )
+        assert msg is None
+
+
+class TestSMSRCSStats:
+    """Tests for SMS/RCS statistics."""
+
+    @pytest.mark.asyncio
+    async def test_get_stats(self):
+        """Test getting statistics."""
+        client = SMSRCSClient(account_sid="AC12345", auth_token="token123")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        await client.send_message(
+            student_id="student123",
+            content="Test message",
+        )
+
+        stats = client.get_stats()
+
+        assert stats["api_configured"] is True
+        assert stats["total_messages"] >= 1
+        assert stats["outbound_messages"] >= 1
+        assert stats["registered_phones"] >= 1
+        assert stats["opted_in"] >= 1
+
+
+class TestRCSCard:
+    """Tests for RCS rich card."""
+
+    def test_rcs_card_creation(self):
+        """Test RCS card creation."""
+        card = RCSCard(
+            title="Test Scholarship",
+            description="Up to $10,000",
+            image_url="https://example.com/image.png",
+        )
+
+        assert card.title == "Test Scholarship"
+        assert card.description == "Up to $10,000"
+        assert card.suggestions == []
+
+    def test_add_reply(self):
+        """Test adding suggested reply."""
+        card = RCSCard(title="Test", description="Description")
+
+        card.add_reply("Apply Now", "apply")
+        card.add_reply("Learn More")
+
+        assert len(card.suggestions) == 2
+        assert card.suggestions[0]["type"] == "reply"
+        assert card.suggestions[0]["text"] == "Apply Now"
+
+    def test_add_action(self):
+        """Test adding suggested action."""
+        card = RCSCard(title="Test", description="Description")
+
+        card.add_action("Call Us", "dial", "+15551234567")
+
+        assert len(card.suggestions) == 1
+        assert card.suggestions[0]["type"] == "action"
+        assert card.suggestions[0]["action_type"] == "dial"
+
+    @pytest.mark.asyncio
+    async def test_send_rcs_card_fallback(self):
+        """Test RCS card falls back to text for non-RCS phones."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        card = RCSCard(
+            title="Scholarship Found!",
+            description="Up to $5,000 available",
+        )
+        card.add_reply("View Details")
+        card.add_reply("Apply Now")
+
+        message = await client.send_rcs_card(
+            student_id="student123",
+            card=card,
+        )
+
+        assert message is not None
+        assert "Scholarship Found!" in message.content
+        assert "Up to $5,000" in message.content
+
+
+class TestPhoneNumber:
+    """Tests for PhoneNumber dataclass."""
+
+    def test_phone_number_creation(self):
+        """Test PhoneNumber creation."""
+        phone = PhoneNumber(
+            number="+15551234567",
+            rcs_enabled=True,
+            verified=True,
+        )
+
+        assert phone.number == "+15551234567"
+        assert phone.rcs_enabled is True
+        assert phone.opted_in is True
+
+    def test_phone_number_formatted(self):
+        """Test phone number formatting."""
+        phone = PhoneNumber(number="+15551234567")
+
+        assert phone.formatted == "(555) 123-4567"
+
+
+class TestSMSMessage:
+    """Tests for SMSMessage dataclass."""
+
+    def test_sms_message_creation(self):
+        """Test SMSMessage creation."""
+        message = SMSMessage(
+            id="msg123",
+            student_id="student456",
+            phone_number="+15551234567",
+            content="Test message",
+        )
+
+        assert message.id == "msg123"
+        assert message.channel == MessageChannel.SMS
+        assert message.status == MessageStatus.QUEUED
+        assert message.direction == MessageDirection.OUTBOUND
+
+
+class TestConvenienceFunctions:
+    """Tests for convenience functions."""
+
+    @pytest.mark.asyncio
+    async def test_send_reminder(self):
+        """Test send_reminder convenience function."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        await client.register_phone(
+            student_id="student123",
+            phone_number="+15551234567",
+            verify=False,
+        )
+
+        message = await send_reminder(
+            client=client,
+            student_id="student123",
+            message="Don't forget your deadline!",
+        )
+
+        assert message is not None
+        assert message.content == "Don't forget your deadline!"
+
+    @pytest.mark.asyncio
+    async def test_send_bulk_deadline_reminders(self):
+        """Test bulk deadline reminders."""
+        client = SMSRCSClient(account_sid="AC12345")
+
+        # Register multiple students
+        for i in range(3):
+            await client.register_phone(
+                student_id=f"student{i}",
+                phone_number=f"+1555123456{i}",
+                verify=False,
+            )
+
+        reminders = [
+            {
+                "student_id": "student0",
+                "deadline_name": "FAFSA",
+                "deadline_date": datetime.utcnow() + timedelta(days=5),
+                "days_until": 5,
+            },
+            {
+                "student_id": "student1",
+                "deadline_name": "CSS Profile",
+                "deadline_date": datetime.utcnow() + timedelta(days=3),
+                "days_until": 3,
+            },
+        ]
+
+        messages = await send_bulk_deadline_reminders(client, reminders)
+
+        assert len(messages) == 2
+
+
+class TestModuleExports:
+    """Tests for module exports."""
+
+    def test_channels_exports_sms(self):
+        """Test channels module exports SMS/RCS items."""
+        from channels import __all__
+
+        assert 'SMSRCSClient' in __all__
+        assert 'SMSMessage' in __all__
+        assert 'Conversation' in __all__
+        assert 'PhoneNumber' in __all__
+        assert 'RCSCard' in __all__
+        assert 'MessageChannel' in __all__
+        assert 'MessageStatus' in __all__
+        assert 'MESSAGE_TEMPLATES' in __all__
